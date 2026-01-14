@@ -1,19 +1,23 @@
 """
-Training script for Soprano.
+Vietnamese TTS Training Script for Soprano.
+
+Features:
+- Train by epochs with proper evaluation
+- Save checkpoints by step, keep top K best
+- Support Vietnamese tokenizer expansion
+- Full validation at end of each epoch
 
 Usage:
-python train.py --input-dir path/to/files --save-dir path/to/weights
+    python train_vi.py --input-dir ./CSKH_pitel --save-dir ./checkpoints --model-path ./vietnamese_model
 
-Args:
---input-dir: Path to directory of LJSpeech-style dataset. If none is provided this defaults to the provided example dataset.
---save-dir: Path to directory to save weights
-
-Adapted from https://github.com/karpathy/nanoGPT
+See README.md for full documentation.
 """
 import argparse
 import pathlib
 import random
 import time
+import json
+import shutil
 
 import numpy as np
 import torch
@@ -25,196 +29,271 @@ from dataset import AudioDataset
 
 
 def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input-dir",
-        required=False,
-        default="./example_dataset",
-        type=pathlib.Path
-    )
-    parser.add_argument("--save-dir",
-        required=True,
-        type=pathlib.Path
-    )
+    parser = argparse.ArgumentParser(description="Train Soprano TTS with Vietnamese support")
+    parser.add_argument("--input-dir", required=True, type=pathlib.Path,
+        help="Path to dataset directory containing train.json and val.json")
+    parser.add_argument("--save-dir", required=True, type=pathlib.Path,
+        help="Path to save checkpoints and final model")
+    parser.add_argument("--model-path", default="ekwek/Soprano-80M", type=str,
+        help="Path to base model or expanded Vietnamese model")
+    parser.add_argument("--epochs", default=10, type=int,
+        help="Number of training epochs")
+    parser.add_argument("--batch-size", default=4, type=int,
+        help="Batch size for training")
+    parser.add_argument("--learning-rate", default=5e-4, type=float,
+        help="Maximum learning rate")
+    parser.add_argument("--device", default="cuda:0", type=str,
+        help="Device to train on (cuda:0, cpu, etc.)")
+    parser.add_argument("--eval-steps", default=500, type=int,
+        help="Evaluate every N steps")
+    parser.add_argument("--save-steps", default=500, type=int,
+        help="Save checkpoint every N steps")
+    parser.add_argument("--top-k", default=3, type=int,
+        help="Keep top K best checkpoints")
     return parser.parse_args()
 
-args = get_args()
 
-# training hyperparameters
-device = 'cuda:0'
-seed = 1337
-max_lr = 5e-4
-warmup_ratio = 0.1
-cooldown_ratio = 0.1
-min_lr = 0.1 * max_lr
-batch_size = 4
-grad_accum_steps = 1
-seq_len = 1024
-val_freq = 250
-text_factor = 0.0 # currently does not train on text inputs, you can increase to change this
-max_steps = 10000
-betas = (0.9, 0.95)
-weight_decay = 0.1
-train_dataset_path = f'{args.input_dir}/train.json'
-val_dataset_path = f'{args.input_dir}/val.json'
-save_path = args.save_dir
+class CheckpointManager:
+    """Manages saving and keeping top K best checkpoints."""
+    
+    def __init__(self, save_dir, top_k=3):
+        self.save_dir = pathlib.Path(save_dir)
+        self.top_k = top_k
+        self.checkpoints = []
+        self.checkpoint_file = self.save_dir / "checkpoints.json"
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self._load_checkpoint_info()
+    
+    def _load_checkpoint_info(self):
+        if self.checkpoint_file.exists():
+            with open(self.checkpoint_file, 'r') as f:
+                data = json.load(f)
+                self.checkpoints = [(c['val_loss'], c['step'], c['path']) for c in data]
+    
+    def _save_checkpoint_info(self):
+        data = [{'val_loss': c[0], 'step': c[1], 'path': c[2]} for c in self.checkpoints]
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(data, f, indent=2)
+    
+    def save(self, model, tokenizer, optimizer, step, epoch, val_loss, train_loss):
+        checkpoint_name = f"checkpoint-step{step}-epoch{epoch}-loss{val_loss:.4f}"
+        checkpoint_path = self.save_dir / checkpoint_name
+        
+        model.save_pretrained(checkpoint_path)
+        tokenizer.save_pretrained(checkpoint_path)
+        
+        training_state = {
+            'step': step, 'epoch': epoch,
+            'val_loss': val_loss, 'train_loss': train_loss,
+            'optimizer_state_dict': optimizer.state_dict()
+        }
+        torch.save(training_state, checkpoint_path / "training_state.pt")
+        
+        self.checkpoints.append((val_loss, step, str(checkpoint_path)))
+        self.checkpoints.sort(key=lambda x: x[0])
+        
+        while len(self.checkpoints) > self.top_k:
+            worst = self.checkpoints.pop()
+            worst_path = pathlib.Path(worst[2])
+            if worst_path.exists():
+                shutil.rmtree(worst_path)
+                print(f"  Removed: {worst_path.name}")
+        
+        self._save_checkpoint_info()
+        self._print_status()
+        return checkpoint_path
+    
+    def _print_status(self):
+        print(f"\n  Top {self.top_k} Checkpoints:")
+        for i, (loss, s, _) in enumerate(self.checkpoints):
+            marker = "►" if i == 0 else " "
+            print(f"    {marker} {i+1}. Step {s}: val_loss={loss:.4f}")
+    
+    def get_best(self):
+        return pathlib.Path(self.checkpoints[0][2]) if self.checkpoints else None
 
-def worker_seed_init(_):
-    worker_seed = torch.initial_seed() % (2**32-1)
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
 
-def get_lr(it): # WSD schedule
-    if it<warmup_steps:
-        return max_lr * (it+1) / warmup_steps
-    if it<max_steps-cooldown_steps:
+class CollateFunction:
+    def __init__(self, tokenizer, batch_size, seq_len):
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+    
+    def __call__(self, texts):
+        tokens_batch = self.tokenizer(texts, padding=False, truncation=False)
+        batch, cur_sample, cur_size = [], [], 0
+        
+        for i in range(len(texts)):
+            tokens = torch.tensor(tokens_batch['input_ids'][i][:-1], dtype=torch.long)
+            cur_size += tokens.size(0)
+            cur_sample.append(tokens)
+            if cur_size >= self.seq_len + 1:
+                batch.append(torch.cat(cur_sample)[:self.seq_len + 1])
+                cur_sample, cur_size = [], 0
+                if len(batch) == self.batch_size:
+                    break
+        
+        if cur_sample and not batch:
+            batch.append(torch.cat(cur_sample + [torch.zeros(self.seq_len, dtype=torch.long)])[:self.seq_len + 1])
+        
+        while len(batch) < self.batch_size:
+            batch.append(batch[-1])
+        
+        batch = torch.stack(batch)
+        return batch[:, :-1], batch[:, 1:]
+
+
+def get_lr(step, total_steps, max_lr, min_lr, warmup=0.1, cooldown=0.1):
+    warmup_steps = int(total_steps * warmup)
+    cooldown_steps = int(total_steps * cooldown)
+    
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+    if step < total_steps - cooldown_steps:
         return max_lr
-    return min_lr + (max_lr-min_lr) * ((max_steps-it) / cooldown_steps)
+    return min_lr + (max_lr - min_lr) * ((total_steps - step) / cooldown_steps)
 
-def collate_pack(texts):
-    tokens_batch = tokenizer(texts, padding=False, truncation=False)
-    batch = []
-    cur_sample, cur_size = [], 0
-    for i in range(len(texts)):
-        tokens = torch.tensor(tokens_batch['input_ids'][i][:-1], dtype=torch.long)
-        cur_size += tokens.size(0)
-        cur_sample.append(tokens)
-        if cur_size >= seq_len + 1:
-            batch.append(torch.cat(cur_sample)[: seq_len + 1])
-            cur_sample, cur_size = [], 0
-            if len(batch) == batch_size:
-                break
-    if cur_sample and not batch: # add partial sample if there isn't enough data
-        batch.append(torch.cat(cur_sample + [torch.zeros(seq_len, dtype=torch.long)])[: seq_len + 1])
-    if len(batch) < batch_size:
-        # pad up to batch_size for consistency
-        pad = batch[-1]
-        while len(batch) < batch_size:
-            batch.append(pad)
-    batch = torch.stack(batch)
-    x = batch[:, :-1]
-    y = batch[:, 1:]
-    return x, y
 
-def compute_loss(logits, y, num_steps):
+def compute_loss(logits, y, tokenizer, device):
     pred = logits.view(-1, logits.size(-1))
     labels = y.reshape(-1)
     loss = torch.nn.functional.cross_entropy(pred, labels, reduction='none')
-    audio_mask = torch.logical_and(y>=3, y<=8003).view(-1)
-    audio_loss = loss[audio_mask].mean()
-    text_loss = loss[~audio_mask].mean()
-    acc = (logits.argmax(dim=-1) == y).view(-1)[audio_mask].to(torch.float32).mean()
-    audio_loss = audio_loss / num_steps
-    text_loss = text_loss / num_steps
-    acc = acc / num_steps
+    
+    audio_start = tokenizer.convert_tokens_to_ids('[0]')
+    audio_end = tokenizer.convert_tokens_to_ids('[7999]')
+    audio_mask = torch.logical_and(y >= audio_start, y <= audio_end).view(-1)
+    
+    audio_loss = loss[audio_mask].mean() if audio_mask.any() else torch.tensor(0.0).to(device)
+    text_loss = loss[~audio_mask].mean() if (~audio_mask).any() else torch.tensor(0.0).to(device)
+    acc = (logits.argmax(dim=-1) == y).view(-1)[audio_mask].float().mean() if audio_mask.any() else torch.tensor(0.0).to(device)
+    
     return audio_loss, text_loss, acc
 
-def evaluate(val_dataloader):
+
+@torch.no_grad()
+def evaluate(model, dataloader, tokenizer, device, device_type):
     model.eval()
-    val_dataloader_it = iter(val_dataloader)
-    with torch.no_grad():
-        val_audio_loss_accum = torch.tensor(0.0).to(device)
-        val_text_loss_accum = torch.tensor(0.0).to(device)
-        val_acc_accum = torch.tensor(0.0).to(device)
-        val_loss_steps = 1
-        for _ in range(val_loss_steps):
-            x, y = next(val_dataloader_it)
-            x, y = x.to(device), y.to(device)
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits = model(x).logits
-                audio_loss, text_loss, acc = compute_loss(logits, y, val_loss_steps)
-            val_audio_loss_accum += audio_loss.detach()
-            val_text_loss_accum += text_loss.detach()
-            val_acc_accum += acc.detach()
-        print(f"validation text loss: {val_text_loss_accum.item():.4f}\tvalidation audio loss: {val_audio_loss_accum.item():.4f}\tvalidation acc: {val_acc_accum.item():.4f}")
+    total_loss, total_acc, n = 0.0, 0.0, 0
+    
+    for x, y in dataloader:
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            logits = model(x).logits
+            audio_loss, _, acc = compute_loss(logits, y, tokenizer, device)
+        total_loss += audio_loss.item()
+        total_acc += acc.item()
+        n += 1
+    
     model.train()
+    return (total_loss / n, total_acc / n) if n > 0 else (0.0, 0.0)
 
 
-tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
-if __name__ == '__main__':
+def main():
+    args = get_args()
+    
+    device = args.device
     device_type = "cuda" if device.startswith("cuda") else "cpu"
-    torch.manual_seed(seed)
+    seq_len = 1024
+    
+    torch.manual_seed(1337)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed(1337)
     torch.set_float32_matmul_precision('high')
-    print(f"Save Path: {save_path}")
-
-    # lr schedule
-    warmup_steps = int(max_steps * warmup_ratio)
-    cooldown_steps = int(max_steps * cooldown_ratio)
-
-    # model
-    model = AutoModelForCausalLM.from_pretrained('ekwek/Soprano-80M')
-    model.to(torch.bfloat16).to(device)
-    model.train()
-
-    # dataset
-    dataset = AudioDataset(train_dataset_path)
-    # we need batch_size * 16 to have enough tokens after packing
-    dataloader = DataLoader(dataset,
-        batch_size=batch_size * 16,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-        worker_init_fn=worker_seed_init,
-        collate_fn=collate_pack,
-    )
-    dataloader_it = iter(dataloader)
-    val_dataset = AudioDataset(val_dataset_path)
-    val_dataloader = DataLoader(val_dataset,
-        batch_size=batch_size * 16,
-        shuffle=False,
-        num_workers=1,
-        pin_memory=True,
-        persistent_workers=True,
-        worker_init_fn=worker_seed_init,
-        collate_fn=collate_pack,
-    )
-
-    # optimizer
-    opt = torch.optim.AdamW(model.parameters(), max_lr, betas=betas, weight_decay=weight_decay, fused=True)
-
-    pbar = tqdm(range(0, max_steps), ncols=200, dynamic_ncols=True)
-    for step in pbar:
-        start = time.time()
-        if val_freq>0 and (step % val_freq == 0 or step==max_steps-1):
-            evaluate(val_dataloader)
-
-        opt.zero_grad()
-        audio_loss_accum = 0.0
-        text_loss_accum = 0.0
-        acc_accum = 0.0
-        for micro_step in range(grad_accum_steps):
-            try:
-                x, y = next(dataloader_it)
-            except:
-                dataloader_it = iter(dataloader)
-                x, y = next(dataloader_it)
+    
+    # Load model
+    print(f"Loading model: {args.model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    model = AutoModelForCausalLM.from_pretrained(args.model_path)
+    model.to(torch.bfloat16).to(device).train()
+    print(f"Vocab size: {len(tokenizer)}")
+    
+    # Data
+    collate_fn = CollateFunction(tokenizer, args.batch_size, seq_len)
+    
+    train_data = AudioDataset(f'{args.input_dir}/train.json')
+    train_loader = DataLoader(train_data, batch_size=args.batch_size*16, shuffle=True,
+        num_workers=4, pin_memory=True, persistent_workers=True, collate_fn=collate_fn)
+    
+    val_data = AudioDataset(f'{args.input_dir}/val.json')
+    val_loader = DataLoader(val_data, batch_size=args.batch_size*16, shuffle=False,
+        num_workers=1, pin_memory=True, persistent_workers=True, collate_fn=collate_fn)
+    
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * args.epochs
+    
+    print(f"\nConfig: {args.epochs} epochs, {steps_per_epoch} steps/epoch, {total_steps} total steps")
+    print(f"Train: {len(train_data)} samples | Val: {len(val_data)} samples\n")
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), args.learning_rate,
+        betas=(0.9, 0.95), weight_decay=0.1, fused=True)
+    
+    checkpoint_mgr = CheckpointManager(args.save_dir, args.top_k)
+    
+    # Training
+    global_step = 0
+    min_lr = 0.1 * args.learning_rate
+    
+    for epoch in range(args.epochs):
+        print(f"\n{'='*50}\nEpoch {epoch+1}/{args.epochs}\n{'='*50}")
+        
+        epoch_loss, epoch_acc, epoch_steps = 0.0, 0.0, 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for x, y in pbar:
             x, y = x.to(device), y.to(device)
-
+            optimizer.zero_grad()
+            
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits = model(x).logits
-                audio_loss, text_loss, acc = compute_loss(logits, y, grad_accum_steps)
-            audio_loss_accum += audio_loss.detach()
-            text_loss_accum += text_loss.detach()
-            acc_accum += acc.detach()
-            total_loss = audio_loss + text_factor*text_loss
-            total_loss.backward()
+                audio_loss, text_loss, acc = compute_loss(logits, y, tokenizer, device)
+            
+            audio_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            lr = get_lr(global_step, total_steps, args.learning_rate, min_lr)
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr
+            optimizer.step()
+            
+            epoch_loss += audio_loss.item()
+            epoch_acc += acc.item()
+            epoch_steps += 1
+            global_step += 1
+            
+            pbar.set_postfix(loss=f'{audio_loss.item():.3f}', acc=f'{acc.item():.4f}', lr=f'{lr:.1e}')
+            
+            # Eval & Save
+            if global_step % args.eval_steps == 0:
+                val_loss, val_acc = evaluate(model, val_loader, tokenizer, device, device_type)
+                print(f"\n  [Step {global_step}] Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+            
+            if global_step % args.save_steps == 0:
+                val_loss, _ = evaluate(model, val_loader, tokenizer, device, device_type)
+                print(f"\n  Saving checkpoint...")
+                checkpoint_mgr.save(model, tokenizer, optimizer, global_step, epoch+1,
+                    val_loss, epoch_loss/epoch_steps)
+        
+        # End of epoch
+        avg_loss = epoch_loss / epoch_steps
+        val_loss, val_acc = evaluate(model, val_loader, tokenizer, device, device_type)
+        print(f"\nEpoch {epoch+1} Summary:")
+        print(f"  Train Loss: {avg_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+        
+        checkpoint_mgr.save(model, tokenizer, optimizer, global_step, epoch+1, val_loss, avg_loss)
+    
+    # Final
+    print(f"\n{'='*50}\nTraining Complete!\n{'='*50}")
+    
+    final_path = args.save_dir / "final"
+    model.save_pretrained(final_path)
+    tokenizer.save_pretrained(final_path)
+    print(f"Final model: {final_path}")
+    
+    best = checkpoint_mgr.get_best()
+    if best:
+        print(f"Best checkpoint: {best} (loss: {checkpoint_mgr.checkpoints[0][0]:.4f})")
 
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        lr = get_lr(step)
-        for param_group in opt.param_groups:
-            param_group['lr'] = lr
-        opt.step()
-        torch.cuda.synchronize()
-        total_tokens = step * batch_size*seq_len*grad_accum_steps
-        end = time.time()
-        dt = (end-start)*1000
-        tokens_per_second = (batch_size*seq_len*grad_accum_steps) / (end-start)
-        tqdm_log = f'text loss: {text_loss_accum.item():.3f} | audio loss: {audio_loss_accum.item():.3f} | acc: {acc_accum.item():.4f} | lr: {lr:.2e} | norm: {norm:.3f} | time: {dt:.2f} ms | {tokens_per_second:.2f} t/s'
-        pbar.set_description(tqdm_log)
 
-    print(f"Training complete. Saving model at {save_path}")
-    model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
-    print("Saving done.")
+if __name__ == '__main__':
+    main()

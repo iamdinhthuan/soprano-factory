@@ -1,6 +1,26 @@
 __pycache__/
 test.py
-*.json
 *.pth
 dist/
 *.egg-info/
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+
+# Model checkpoints & outputs
+checkpoints/
+vietnamese_model/
+vietnamese_model_finetuned/
+vietnamese_checkpoints/
+*.safetensors
+
+# Dataset files (large)
+CSKH_pitel/
+train.json
+val.json
+
+# Misc
+.DS_Store
+*.log
