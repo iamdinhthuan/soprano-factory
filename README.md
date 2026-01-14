@@ -140,13 +140,37 @@ checkpoints/
 
 ## Inference
 
-Use trained model with [Soprano](https://github.com/ekwek1/soprano):
+### CLI
+```bash
+python infer.py --model-path ./checkpoints/final --text "Xin chào, đây là tiếng Việt!"
+```
 
+### Python
 ```python
 from soprano import SopranoTTS
 
-model = SopranoTTS(model_path='./checkpoints/final')
-audio = model.infer("Xin chào, đây là tiếng Việt!")
+model = SopranoTTS(
+    model_path='./checkpoints/final',
+    device='auto',
+    backend='transformers'  # Required for custom models
+)
+
+audio = model.infer("Xin chào, đây là tiếng Việt!", "output.wav")
+```
+
+### Colab/Notebook
+```python
+# Install
+!pip install soprano-tts
+
+# Inference
+from soprano import SopranoTTS
+model = SopranoTTS(model_path='./checkpoints/final', backend='transformers')
+audio = model.infer("Xin chào!", "output.wav")
+
+# Play
+from IPython.display import Audio
+Audio("output.wav")
 ```
 
 ---
